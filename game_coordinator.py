@@ -7,7 +7,6 @@ from geometry_msgs.msg import Twist
 import json
 import time
 import random
-import math
 
 class GameCoordinator(Node):
     def __init__(self):
@@ -23,10 +22,12 @@ class GameCoordinator(Node):
         self.random_walk_duration = self.get_parameter('random_walk_duration').get_parameter_value().double_value
         
         # Game state
-        self.game_state = 'exploring'  # exploring, following_marker, hiding, stopped, random_walk
+        self.game_state = 'wall_following' if self.self_aruco_id == 1 else 'exploring'  # Robot 1 starts wall following, Robot 0 starts exploring
         self.state_start_time = None
         self.tagged_by = None
         self.tagged_robot = None
+        self.current_role = 'hider' if self.self_aruco_id == 1 else 'seeker'  # Robot 0 is initial seeker, Robot 1 is initial hider
+        self.robot_detected = False  # Track if another robot is detected
         
         # Publishers
         self.explore_trigger_pub = self.create_publisher(Bool, '/explore_trigger', 10)
@@ -34,10 +35,13 @@ class GameCoordinator(Node):
         self.stop_hiding_pub = self.create_publisher(Empty, '/stop_hiding', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.server_command_pub = self.create_publisher(String, '/server_command', 10)
+        self.game_status_pub = self.create_publisher(String, '/game_status', 10)
         
         # Subscribers
         self.robot_tagged_sub = self.create_subscription(String, '/robot_tagged', self.robot_tagged_callback, 10)
         self.server_response_sub = self.create_subscription(String, '/server_response', self.server_response_callback, 10)
+        self.game_status_sub = self.create_subscription(String, '/game_status', self.game_status_callback, 10)
+        self.movement_priority_sub = self.create_subscription(String, '/movement_priority', self.movement_priority_callback, 10)
         
         # Timers
         self.state_timer = self.create_timer(0.1, self.state_machine_update)  # 10Hz state machine
@@ -50,11 +54,20 @@ class GameCoordinator(Node):
         self.last_random_walk_change = 0
         self.current_random_cmd = Twist()
         
-        # Start in exploring state
-        self.set_state('exploring')
+        # Movement priority control
+        self.current_movement_priority = "none"  # Track who has movement control
+        self.can_publish_movement = True  # Whether this node can publish movement commands
+        
+        # Start with appropriate initial behavior
+        if self.self_aruco_id == 1:
+            self.set_state('wall_following')  # Robot 1 (hider) starts with wall following
+        else:
+            self.set_state('exploring')  # Robot 0 (seeker) starts exploring
         
         self.get_logger().info(f'Game Coordinator initialized for robot {self.self_aruco_id}')
+        self.get_logger().info(f'Initial role: {self.current_role}, Initial state: {self.game_state}')
         self.get_logger().info(f'Timeout duration: {self.timeout_duration}s, Random walk duration: {self.random_walk_duration}s')
+        self.get_logger().info(f'Robot behavior: Robot 0 seeks, Robot 1 starts wall following (via explore node) until robot detected')
     
     def set_state(self, new_state):
         """Set new game state and handle state transitions"""
@@ -74,6 +87,8 @@ class GameCoordinator(Node):
                 self.stop_all_movement()
             elif new_state == 'random_walk':
                 self.start_random_walk()
+            elif new_state == 'wall_following':
+                self.start_wall_following()
     
     def start_exploring(self):
         """Start exploration behavior"""
@@ -106,17 +121,40 @@ class GameCoordinator(Node):
         """Stop all robot movement"""
         self.stop_exploring()
         self.stop_hiding()
-        stop_cmd = Twist()
-        self.cmd_vel_pub.publish(stop_cmd)
-        self.get_logger().info('Stopped all movement')
+        self.stop_wall_following()
+        if self.can_publish_movement:
+            stop_cmd = Twist()
+            self.cmd_vel_pub.publish(stop_cmd)
+            self.get_logger().info('Stopped all movement')
     
     def start_random_walk(self):
         """Start random walk behavior"""
         self.stop_exploring()
         self.stop_hiding()
+        self.stop_wall_following()
         self.last_random_walk_change = 0
         self.generate_random_movement()
         self.get_logger().info('Started random walk')
+        
+        # Publish game status for random walk start
+        game_status_msg = String()
+        game_status_msg.data = f"Robot {self.self_aruco_id} started random walk after hiding"
+        self.game_status_pub.publish(game_status_msg)
+    
+    def start_wall_following(self):
+        """Start wall following behavior using explore node"""
+        self.stop_hiding()
+        explore_msg = Bool()
+        explore_msg.data = True
+        self.explore_trigger_pub.publish(explore_msg)
+        self.get_logger().info('Started wall following behavior via explore node')
+    
+    def stop_wall_following(self):
+        """Stop wall following behavior"""
+        explore_msg = Bool()
+        explore_msg.data = False
+        self.explore_trigger_pub.publish(explore_msg)
+        self.get_logger().info('Stopped wall following behavior')
     
     def generate_random_movement(self):
         """Generate random movement command"""
@@ -132,7 +170,7 @@ class GameCoordinator(Node):
     
     def random_walk_update(self):
         """Update random walk behavior"""
-        if self.game_state == 'random_walk':
+        if self.game_state == 'random_walk' and self.can_publish_movement:
             current_time = time.time()
             
             # Change direction periodically
@@ -140,8 +178,9 @@ class GameCoordinator(Node):
                 self.generate_random_movement()
                 self.last_random_walk_change = current_time
             
-            # Publish random walk command
-            self.cmd_vel_pub.publish(self.current_random_cmd)
+            # Publish random walk command only if we have movement priority
+            if self.can_publish_movement:
+                self.cmd_vel_pub.publish(self.current_random_cmd)
     
     def robot_tagged_callback(self, msg):
         """Handle robot tagged event"""
@@ -171,16 +210,28 @@ class GameCoordinator(Node):
             
             # Handle tag event for this robot
             if tagger_id == self.self_aruco_id:
-                # This robot tagged someone - start hiding
+                # This robot tagged someone - role switches, now become hider and go far away
                 self.tagged_robot = tagged_id
+                self.current_role = 'hider'
                 self.set_state('hiding')
-                self.get_logger().info(f'I tagged robot {tagged_id} - starting to hide')
+                self.get_logger().info(f'I tagged robot {tagged_id} - role switched to hider, starting to hide')
+                
+                # Publish game status for role switch
+                game_status_msg = String()
+                game_status_msg.data = f"Robot {self.self_aruco_id} becomes hider now, robot {tagged_id} is seeker"
+                self.game_status_pub.publish(game_status_msg)
                 
             elif tagged_id == self.self_aruco_id:
-                # This robot was tagged - stop for timeout duration
+                # This robot was tagged - role switches, now become seeker 
                 self.tagged_by = tagger_id
-                self.set_state('stopped')
-                self.get_logger().info(f'I was tagged by robot {tagger_id} - stopping for {self.timeout_duration}s')
+                self.current_role = 'seeker'
+                self.set_state('exploring')  # Immediately start seeking
+                self.get_logger().info(f'I was tagged by robot {tagger_id} - role switched to seeker, starting to seek')
+                
+                # Publish game status for role switch
+                game_status_msg = String()
+                game_status_msg.data = f"Robot {tagger_id} becomes hider now, robot {self.self_aruco_id} is seeker"
+                self.game_status_pub.publish(game_status_msg)
             
         except Exception as e:
             self.get_logger().error(f'Error processing robot_tagged message: {e}')
@@ -197,11 +248,57 @@ class GameCoordinator(Node):
                 robot_id = response.get('robot_id')
                 
                 if robot_id == self.self_aruco_id:
+                    self.current_role = role
                     self.get_logger().info(f'My role updated to: {role}')
                     # Handle role-specific behavior here if needed
                     
         except Exception as e:
             self.get_logger().error(f'Error processing server response: {e}')
+    
+    def game_status_callback(self, msg):
+        """Handle game status updates (robot detection)"""
+        try:
+            # Check if ArUco tags are detected
+            if "ArUco tags detected:" in msg.data:
+                detected_ids_str = msg.data.replace("ArUco tags detected: ", "")
+                detected_ids = eval(detected_ids_str)  # Parse the list
+                
+                # Check if other robot is detected
+                other_robot_id = 0 if self.self_aruco_id == 1 else 1
+                if other_robot_id in detected_ids:
+                    if not self.robot_detected:
+                        self.robot_detected = True
+                        self.get_logger().info(f'Other robot {other_robot_id} detected!')
+                        
+                        # If this robot is hider and sees another robot, switch to seeking
+                        if self.current_role == 'hider' and self.game_state == 'wall_following':
+                            self.get_logger().info('Hider detected seeker - switching to exploring/seeking mode')
+                            self.stop_wall_following()  # Stop wall following first
+                            self.set_state('exploring')
+                else:
+                    if self.robot_detected:
+                        self.robot_detected = False
+                        self.get_logger().info('Other robot no longer detected')
+                        
+                        # If hider loses sight of seeker, resume wall following
+                        if self.current_role == 'hider' and self.game_state == 'exploring':
+                            self.get_logger().info('Hider lost sight of seeker - resuming wall following')
+                            self.stop_exploring()  # Stop exploring first
+                            self.set_state('wall_following')
+            
+            elif "No ArUco tags detected" in msg.data:
+                if self.robot_detected:
+                    self.robot_detected = False
+                    self.get_logger().info('No robots detected')
+                    
+                    # If hider loses sight of seeker, resume wall following
+                    if self.current_role == 'hider' and self.game_state == 'exploring':
+                        self.get_logger().info('Hider lost sight of seeker - resuming wall following')
+                        self.stop_exploring()  # Stop exploring first
+                        self.set_state('wall_following')
+                        
+        except Exception as e:
+            self.get_logger().error(f'Error processing game status: {e}')
     
     def state_machine_update(self):
         """Update state machine and handle timing"""
@@ -213,20 +310,34 @@ class GameCoordinator(Node):
         
         # Handle state timeouts
         if self.game_state == 'hiding' and elapsed_time >= self.timeout_duration:
-            # Hiding timeout - switch to random walk
+            # Hiding timeout - switch behavior based on role
             self.stop_hiding()
-            self.set_state('random_walk')
-            self.get_logger().info(f'Hiding timeout ({self.timeout_duration}s) - switching to random walk')
+            if self.current_role == 'hider':
+                # Hider should resume wall following after hiding
+                self.set_state('wall_following')
+                self.get_logger().info(f'Hiding timeout ({self.timeout_duration}s) - hider resuming wall following')
+            else:
+                # Seeker should resume exploring
+                self.set_state('exploring')
+                self.get_logger().info(f'Hiding timeout ({self.timeout_duration}s) - seeker resuming exploration')
             
         elif self.game_state == 'stopped' and elapsed_time >= self.timeout_duration:
-            # Stop timeout - resume exploring
-            self.set_state('exploring')
-            self.get_logger().info(f'Stop timeout ({self.timeout_duration}s) - resuming exploration')
+            # Stop timeout - resume appropriate behavior based on role
+            if self.current_role == 'hider':
+                self.set_state('wall_following')
+                self.get_logger().info(f'Stop timeout ({self.timeout_duration}s) - hider resuming wall following')
+            else:
+                self.set_state('exploring')
+                self.get_logger().info(f'Stop timeout ({self.timeout_duration}s) - seeker resuming exploration')
             
         elif self.game_state == 'random_walk' and elapsed_time >= self.random_walk_duration:
-            # Random walk timeout - resume exploring
-            self.set_state('exploring')
-            self.get_logger().info(f'Random walk timeout ({self.random_walk_duration}s) - resuming exploration')
+            # Random walk timeout - resume appropriate behavior based on role
+            if self.current_role == 'hider':
+                self.set_state('wall_following')
+                self.get_logger().info(f'Random walk timeout ({self.random_walk_duration}s) - hider resuming wall following')
+            else:
+                self.set_state('exploring')
+                self.get_logger().info(f'Random walk timeout ({self.random_walk_duration}s) - seeker resuming exploration')
     
     def get_state(self):
         """Get current game state"""
@@ -238,6 +349,20 @@ class GameCoordinator(Node):
             return 0.0
         current_time = self.get_clock().now()
         return (current_time - self.state_start_time).nanoseconds / 1e9
+
+    def movement_priority_callback(self, msg):
+        """Handle movement priority updates to prevent command conflicts"""
+        self.current_movement_priority = msg.data
+        
+        # Game coordinator can only publish movement if no higher priority node is active
+        if msg.data.startswith("aruco_detector"):
+            self.can_publish_movement = False
+            self.get_logger().debug(f'ArUco detector has movement priority - stopping game coordinator movement')
+        elif msg.data == "none":
+            self.can_publish_movement = True
+            self.get_logger().debug('Movement priority released - game coordinator can move')
+        else:
+            self.can_publish_movement = True  # Allow other nodes like hider_node
 
 def main(args=None):
     rclpy.init(args=args)
