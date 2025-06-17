@@ -25,7 +25,7 @@ class PythonServer:
         self.client_connections = []
         self.running = False
 
-        # Game state management
+        # Game state management - Only 2 robots
         self.robot_tagger_state = {
             '0': {
                 'role': 'seeker',
@@ -35,13 +35,6 @@ class PythonServer:
                 'tagged_count': 0
             },
             '1': {
-                'role': 'hider',
-                'status': 'active',
-                'last_tagged_time': None,
-                'tagged_by': None,
-                'tagged_count': 0
-            },
-            '2': {
                 'role': 'hider',
                 'status': 'active',
                 'last_tagged_time': None,
@@ -78,7 +71,7 @@ class PythonServer:
         }
         
     def process_tag_event(self, tagger_id: int, tagged_id: int):
-        """Process a robot tagging event and update roles"""
+        """Process a robot tagging event and immediately switch roles between 2 robots"""
         self.logger.info(f"Processing tag event: Robot {tagger_id} tagged Robot {tagged_id}")
         
         tagger_key = str(tagger_id)
@@ -86,24 +79,29 @@ class PythonServer:
         
         current_time = time.time()
         
-        # Validate robot IDs
+        # Validate robot IDs (only 0 and 1 allowed)
         if tagger_key not in self.robot_tagger_state or tagged_key not in self.robot_tagger_state:
             self.logger.error(f"Invalid robot IDs: tagger={tagger_key}, tagged={tagged_key}")
             return
         
-        # Update tagged robot state
+        # Update tagged robot statistics
         self.robot_tagger_state[tagged_key]['last_tagged_time'] = current_time
         self.robot_tagger_state[tagged_key]['tagged_by'] = tagger_id
         self.robot_tagger_state[tagged_key]['tagged_count'] += 1
-        self.robot_tagger_state[tagged_key]['status'] = 'tagged_timeout'
         
-        # Update tagger robot state
-        self.robot_tagger_state[tagger_key]['status'] = 'hiding'
+        # Simple role switch: swap roles immediately
+        old_tagger_role = self.robot_tagger_state[tagger_key]['role']
+        old_tagged_role = self.robot_tagger_state[tagged_key]['role']
         
-        # Role assignment: The tagged robot will become seeker after timeout
-        # This happens in process_timeout_recovery() after 10 seconds
-        self.logger.info(f"Robot {tagged_id} will become seeker after 10-second timeout")
-        self.logger.info(f"Robot {tagger_id} is now hiding")
+        # Swap roles
+        self.robot_tagger_state[tagger_key]['role'] = old_tagged_role
+        self.robot_tagger_state[tagged_key]['role'] = old_tagger_role
+        
+        # Both robots remain active (no timeout needed for 2-robot game)
+        self.robot_tagger_state[tagger_key]['status'] = 'active'
+        self.robot_tagger_state[tagged_key]['status'] = 'active'
+        
+        self.logger.info(f"Role switch complete: Robot {tagger_id} is now {old_tagged_role}, Robot {tagged_id} is now {old_tagger_role}")
         
         # Add event to shared data
         tag_event = {
@@ -111,6 +109,10 @@ class PythonServer:
             'tagger_id': tagger_id,
             'tagged_id': tagged_id,
             'timestamp': current_time,
+            'role_switch': {
+                'robot_' + str(tagger_id): old_tagged_role,
+                'robot_' + str(tagged_id): old_tagger_role
+            },
             'new_roles': {
                 str(robot_id): state['role'] 
                 for robot_id, state in self.robot_tagger_state.items()
@@ -127,72 +129,29 @@ class PythonServer:
         self.logger.info(f"Updated game state: {self.robot_tagger_state}")
         
     def process_timeout_recovery(self):
-        """Process robots recovering from timeout"""
+        """Process robots recovering from timeout - simplified for 2-robot game"""
         current_time = time.time()
-        timeout_duration = 10.0  # 10 seconds (changed from 20)
         
+        # For 2-robot game, both robots should always be active
+        # This method mainly ensures game state consistency
         for robot_id, state in self.robot_tagger_state.items():
-            if (state['status'] == 'tagged_timeout' and 
-                state['last_tagged_time'] and 
-                current_time - state['last_tagged_time'] >= timeout_duration):
-                
-                # Timeout recovered - robot can resume exploring
+            if state['status'] != 'active':
                 state['status'] = 'active'
-                
-                # Role switching: Tagged robot becomes the seeker
-                # First, find the current seeker and make them a hider
-                current_seeker = None
-                for rid, rstate in self.robot_tagger_state.items():
-                    if rstate['role'] == 'seeker':
-                        current_seeker = rid
-                        break
-                
-                if current_seeker:
-                    self.robot_tagger_state[current_seeker]['role'] = 'hider'
-                    self.logger.info(f"Role switch: Robot {current_seeker} is now hider")
-                
-                # Tagged robot becomes the new seeker
-                state['role'] = 'seeker'
-                self.logger.info(f"Robot {robot_id} timeout recovered - resuming active state as seeker")
-                
-                # Add recovery event
-                recovery_event = {
-                    'type': 'timeout_recovery',
-                    'robot_id': int(robot_id),
-                    'timestamp': current_time,
-                    'new_role': 'seeker'
-                }
-                
-                with self.events_lock:
-                    self.game_events.append(recovery_event)
-                    if len(self.game_events) > 10:
-                        self.game_events = self.game_events[-10:]
+                self.logger.info(f"Robot {robot_id} status reset to active")
+        
+        # Ensure one robot is seeker and one is hider
+        roles = [state['role'] for state in self.robot_tagger_state.values()]
+        if roles.count('seeker') != 1 or roles.count('hider') != 1:
+            self.logger.warning("Role inconsistency detected - fixing roles")
+            self.robot_tagger_state['0']['role'] = 'seeker'
+            self.robot_tagger_state['1']['role'] = 'hider'
+            self.logger.info("Roles reset: Robot 0 is seeker, Robot 1 is hider")
     
     def process_hiding_timeout(self):
-        """Process robots finishing hiding behavior"""
-        current_time = time.time()
-        hiding_duration = 20.0  # 20 seconds
-        
-        for robot_id, state in self.robot_tagger_state.items():
-            if (state['status'] == 'hiding' and 
-                state['last_tagged_time'] and 
-                current_time - state['last_tagged_time'] >= hiding_duration):
-                
-                # Hiding completed - robot should start random walk
-                state['status'] = 'random_walk'
-                self.logger.info(f"Robot {robot_id} hiding completed - starting random walk")
-                
-                # Add hiding completion event
-                hiding_event = {
-                    'type': 'hiding_complete',
-                    'robot_id': int(robot_id),
-                    'timestamp': current_time
-                }
-                
-                with self.events_lock:
-                    self.game_events.append(hiding_event)
-                    if len(self.game_events) > 10:
-                        self.game_events = self.game_events[-10:]
+        """Process robots finishing hiding behavior - simplified for 2-robot game"""
+        # In a 2-robot game, no hiding timeout is needed
+        # Both robots stay active and switch roles immediately upon tagging
+        pass
     
     def add_game_event(self, event_data):
         """Add a game event from external source"""
@@ -363,10 +322,10 @@ class PythonServer:
                 'action': 'idle'
             }
             
-            # Simulate marker detection data
+            # Simulate marker detection data for 2 robots
             if self.shared_data['message_count'] % 100 < 30:
                 self.shared_data['marker_data'] = {
-                    'detected_markers': [0, 1, 2],
+                    'detected_markers': [0, 1],
                     'target_marker': 1,
                     'distance_to_target': abs(2.0 * math.sin(t * 0.2))
                 }
@@ -431,7 +390,8 @@ class PythonServer:
 
 def main():
     """Main function to run the server"""
-    print(f"Starting server on IP: {LAPTOP_IP}")
+    print(f"Starting 2-robot tag game server on IP: {LAPTOP_IP}")
+    print("Game rules: Simple role switching between 2 robots")
     server = PythonServer(host=LAPTOP_IP, port=8888)
     
     try:
