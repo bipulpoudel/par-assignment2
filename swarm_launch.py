@@ -49,7 +49,7 @@ def generate_launch_description():
     
     aruco_marker_detector_node = Node(
         package='swarm_tag',
-        executable='aruko_marker_detector',
+        executable='aruco_marker_detector',
         name='aruco_marker_detector',
         parameters=[{
             'self_aruco_id': self_aruco_id,
