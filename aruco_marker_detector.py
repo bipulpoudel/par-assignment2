@@ -20,10 +20,10 @@ class DetectorAndSeekrNode(Node):
         self.declare_parameter('camera_info_topic', '/oak/rgb/camera_info')
         self.declare_parameter('aruco_dict_id', 0)
         self.declare_parameter('aruco_marker_id', 0)  # This robot's marker ID
-        self.declare_parameter('marker_length', 0.05)
+        self.declare_parameter('marker_length', 0.05)  # Standard marker size as in old detector
         self.declare_parameter('max_linear_speed', 0.8)  # Increased to 1.0 m/s for high speed
         self.declare_parameter('max_angular_speed', 1.2)  # Increased to 1.2 rad/s for fast turning
-        self.declare_parameter('stop_distance', 0.7)  # Slightly closer approach for efficiency
+        self.declare_parameter('stop_distance', 0.7)  # Slightly closer approach for efficiency (from old detector)
         
         # Obstacle detection parameters - optimized for continuous movement
         self.declare_parameter('enable_obstacle_detection', False)
@@ -99,6 +99,8 @@ class DetectorAndSeekrNode(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.robot_tagged_pub = self.create_publisher(String, '/robot_tagged', 10)
         self.explore_trigger_pub = self.create_publisher(Bool, '/explore_trigger', 10)
+        self.game_status_pub = self.create_publisher(String, '/game_status', 10)
+        self.movement_priority_pub = self.create_publisher(String, '/movement_priority', 10)
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
         self.camera_info_sub = self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, 10)
 
@@ -117,7 +119,9 @@ class DetectorAndSeekrNode(Node):
         self.get_logger().info('Simple ArUco Mover initialized')
         self.get_logger().info(f'Robot marker ID: {self.aruco_marker_id}')
         self.get_logger().info(f'Will stop at {self.stop_distance}m from markers and publish /robot_tagged')
+        self.get_logger().info(f'Publishing game status to /game_status topic with detected ArUco tag IDs')
         self.get_logger().info(f'Smooth movement enabled: smoothing={self.smoothing_factor}, max_accel={self.max_acceleration}m/s²')
+        self.get_logger().info(f'✅ USING OLD DETECTOR LOGIC - Simple ArUco distance calculation')
         self.get_logger().info(f'Seeking mode: {self.seeking} - robot will only move when seeking=True')
         self.get_logger().info('Subscribed to /explore_trigger to control seeking behavior')
         if self.enable_obstacle_detection:
@@ -219,6 +223,15 @@ class DetectorAndSeekrNode(Node):
             rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
                 corners, self.marker_length, self.camera_matrix, self.dist_coeffs)
             
+            # Publish specific detection events
+            detected_ids = ids.flatten().tolist()
+            for detected_id in detected_ids:
+                if detected_id != self.aruco_marker_id:  # Don't report detecting self
+                    game_status_msg = String()
+                    game_status_msg.data = f"Robot {self.aruco_marker_id} detected robot {detected_id}"
+                    self.game_status_pub.publish(game_status_msg)
+                    self.get_logger().info(f'Game Status: Robot {self.aruco_marker_id} detected robot {detected_id}')
+            
             # Find closest unvisited marker
             closest_marker = None
             closest_distance = float('inf')
@@ -227,6 +240,7 @@ class DetectorAndSeekrNode(Node):
             for i, marker_id in enumerate(ids.flatten()):
                 if marker_id not in self.visited_markers:
                     tvec = tvecs[i][0]
+                    # Use simple ArUco distance calculation (like old detector)
                     distance = np.linalg.norm(tvec)
                     if distance < closest_distance:
                         closest_distance = distance
@@ -235,6 +249,13 @@ class DetectorAndSeekrNode(Node):
             
             if closest_marker is not None:
                 self.last_marker_time = self.get_clock().now()
+                
+                # Publish game status for robot detection (only once per detection)
+                if not self.seeking:  # Only publish when transitioning from not seeking to seeking
+                    game_status_msg = String()
+                    game_status_msg.data = f"Robot {self.aruco_marker_id} detected robot {closest_marker}"
+                    self.game_status_pub.publish(game_status_msg)
+                    self.get_logger().info(f'🎯 Robot {closest_marker} detected at {closest_distance:.2f}m - starting pursuit!')
                 
                 # Send False to explore_trigger when marker is detected
                 explore_msg = Bool()
@@ -254,8 +275,16 @@ class DetectorAndSeekrNode(Node):
         if self.seeking:
             smooth_cmd = self.apply_smoothing(cmd)
             self.cmd_vel_pub.publish(smooth_cmd)
+            # Claim highest priority control
+            priority_msg = String()
+            priority_msg.data = f"aruco_detector_{self.aruco_marker_id}"
+            self.movement_priority_pub.publish(priority_msg)
         else:
-            # If not seeking, publish stop command
+            # If not seeking, release priority control
+            priority_msg = String()
+            priority_msg.data = "none"
+            self.movement_priority_pub.publish(priority_msg)
+            # Publish stop command
             stop_cmd = Twist()
             self.cmd_vel_pub.publish(stop_cmd)
 
@@ -274,6 +303,11 @@ class DetectorAndSeekrNode(Node):
             self.robot_tagged_pub.publish(tagged_msg)
             self.get_logger().info(f'Published /robot_tagged: Robot {self.aruco_marker_id} tagged Robot {marker_id}')
             
+            # Publish game status for tagging event
+            game_status_msg = String()
+            game_status_msg.data = f"Robot {self.aruco_marker_id} tagged robot {marker_id}"
+            self.game_status_pub.publish(game_status_msg)
+            
             # Send True to explore_trigger after tagging to resume exploring
             explore_msg = Bool()
             explore_msg.data = True
@@ -284,13 +318,13 @@ class DetectorAndSeekrNode(Node):
             self.prev_angular_z = 0.0
             return cmd  # Stop (zero velocity)
         
-        # DEBUG: Print raw tvec values to understand coordinate system
+        # DEBUG: Print raw tvec values to understand coordinate system (like old detector)
         self.get_logger().info(f'DEBUG - Marker {marker_id} tvec: x={tvec[0]:.3f}, y={tvec[1]:.3f}, z={tvec[2]:.3f}')
         
-        # Calculate angle to marker (tvec[0] is x offset, tvec[2] is forward distance)
+        # Calculate angle to marker (tvec[0] is x offset, tvec[2] is forward distance) - old detector logic
         angle_to_marker = math.atan2(tvec[0], tvec[2])
         
-        # DEBUG: Determine movement direction based on tvec
+        # DEBUG: Determine movement direction based on tvec (like old detector)
         if tvec[2] > 0:
             # Marker is in front - move forward
             move_direction = 1.0
@@ -462,19 +496,31 @@ class DetectorAndSeekrNode(Node):
         if self.last_marker_time is not None:
             time_since_marker = (self.get_clock().now() - self.last_marker_time).nanoseconds / 1e9
             if time_since_marker > 2.0:  # 2 seconds without seeing a marker
-                cmd = Twist()  # Stop
-                # Force immediate stop for safety - reset smoothing
-                self.prev_linear_x = 0.0
-                self.prev_angular_z = 0.0
-                self.cmd_vel_pub.publish(cmd)  # Publish zero directly
-                self.seeking = False  # Disable seeking
-                
-                # Resume exploring when no markers are detected
-                explore_msg = Bool()
-                explore_msg.data = True
-                self.explore_trigger_pub.publish(explore_msg)
-                
-                self.get_logger().debug('No markers detected - robot stopped and resuming exploration')
+                # Only act if we were previously seeking (to avoid spam)
+                if self.seeking:
+                    cmd = Twist()  # Stop
+                    # Force immediate stop for safety - reset smoothing
+                    self.prev_linear_x = 0.0
+                    self.prev_angular_z = 0.0
+                    self.cmd_vel_pub.publish(cmd)  # Publish zero directly
+                    self.seeking = False  # Disable seeking
+                    
+                    # Resume exploring when no markers are detected
+                    explore_msg = Bool()
+                    explore_msg.data = True
+                    self.explore_trigger_pub.publish(explore_msg)
+                    
+                    # Publish game status for timeout
+                    game_status_msg = String()
+                    game_status_msg.data = f"Robot {self.aruco_marker_id} stopped seeking after 2.0s timeout - resuming exploration"
+                    self.game_status_pub.publish(game_status_msg)
+                    
+                    self.get_logger().info(f'⏰ Safety timeout: No markers detected for {time_since_marker:.1f}s - stopped seeking and resuming exploration')
+                    
+                    # Reset marker time to prevent repeated triggering
+                    self.last_marker_time = None
+
+
 
 def main(args=None):
     rclpy.init(args=args)
